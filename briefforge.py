@@ -690,8 +690,21 @@ def fetch_page(url, logf):
         title_tag = soup.find("title")
         title = title_tag.get_text(strip=True) if title_tag else ""
 
+        # Remove extra noise: cookie banners, popups, nav widgets
+        for sel in ["[class*=\'cookie\']","[class*=\'popup\']","[class*=\'breadcrumb\']",
+                    "[class*=\'pagination\']","[class*=\'social\']","[id*=\'cookie\']",
+                    "[id*=\'popup\']","[role=\'navigation\']","[role=\'contentinfo\']"]:
+            try:
+                for el in soup.select(sel): el.decompose()
+            except Exception: pass
+
         raw = soup.get_text(" ", strip=True)
-        text = re.sub(r"\s+", " ", raw).strip()
+        # Keep sentence-like chunks only (strips menu/nav garbage)
+        lines = re.split(r'(?<=[.!?])\s+|\n', raw)
+        clean = [l.strip() for l in lines if len(re.findall(r"\b[a-zA-Z]{3,}\b", l)) >= 4]
+        text = re.sub(r"\s+", " ", " ".join(clean)).strip()
+        if len(text) < 300:  # fallback if too aggressive
+            text = re.sub(r"\s+", " ", raw).strip()
         words = len(re.findall(r"\b\w+\b", text))
 
         return {"url": url, "text": text, "headings": headings,
@@ -699,6 +712,78 @@ def fetch_page(url, logf):
     except Exception as e:
         logf(f"  ❌ Parse error: {e}")
         return None
+
+
+# ── Smart term quality filter ──────────────────────────────
+# Common UI/nav/garbage words that appear on every website but mean nothing for content
+_UI_GARBAGE = {
+    "cookie","cookies","privacy","policy","terms","copyright","rights reserved",
+    "all rights","subscribe","newsletter","sign up","log in","login","logout",
+    "sign in","register","account","cart","menu","search","home","back","next",
+    "previous","click","tap","swipe","scroll","share","follow","like","comment",
+    "reply","submit","cancel","close","open","read more","learn more","view",
+    "see more","show","hide","toggle","filter","sort","page","pages","load",
+    "loading","error","warning","alert","notice","message","notification",
+    "advertisement","sponsored","ad","ads","promo","sale","off","discount",
+    "free shipping","add to cart","buy now","shop now","contact us","about us",
+    "faq","help","support","feedback","review","reviews","rating","ratings",
+    "price","prices","cost","shipping","delivery","return","refund","checkout",
+    "payment","order","orders","track","tracking","wishlist","compare",
+    "related","recommended","popular","trending","new","featured","best seller",
+    "recently viewed","you may also","people also","customers also",
+    "js","css","html","php","url","http","https","www","com","org","net",
+    "nbsp","quot","amp","lt","gt","px","em","rem","rgb","rgba","hex",
+    "var","function","return","class","style","type","data","id","src",
+}
+
+def _is_quality_term(term: str) -> bool:
+    """Return True if the term is a real content term worth including in a brief."""
+    t = term.strip().lower()
+
+    # Too short (single chars or 2-char abbreviations like 'mp', 'ib', 'tb')
+    if len(t) <= 2:
+        return False
+
+    # All digits or mostly digits
+    if re.fullmatch(r"[\d\s\-\.]+", t):
+        return False
+
+    # Looks like an abbreviation: 2-4 uppercase letters only (e.g. RGB, CTA, SEO is OK but not random ones)
+    words_in_term = t.split()
+    if len(words_in_term) == 1 and len(t) <= 4 and t.isupper():
+        return False
+
+    # Contains special characters that indicate code/UI artifacts
+    if re.search(r"[{}<>\\|@#$%^*=+~`]", t):
+        return False
+
+    # Starts or ends with digits/punctuation
+    if re.match(r"^[\d\.\-_\/]", t) or re.search(r"[\d\.\-_\/]$", t):
+        return False
+
+    # Single repeated character
+    if len(set(t.replace(" ",""))) <= 2 and len(t) > 2:
+        return False
+
+    # Known UI garbage
+    if t in _UI_GARBAGE:
+        return False
+    for garbage in _UI_GARBAGE:
+        if t == garbage:
+            return False
+
+    # Must have at least one real alphabetic word of 3+ chars
+    real_words = [w for w in words_in_term if re.fullmatch(r"[a-z]{3,}", w)]
+    if not real_words:
+        return False
+
+    # For multi-word phrases: each word should be a real word (no random abbreviations)
+    if len(words_in_term) > 1:
+        for w in words_in_term:
+            if len(w) <= 2 and not re.fullmatch(r"[a-z]{2}", w):
+                return False
+
+    return True
 
 
 # ── Brief generation ───────────────────────────────────────
@@ -709,7 +794,7 @@ def make_brief(pages, keyword, logf):
     wcs   = [p["word_count"] for p in pages]
 
     logf("🔬 Running TF-IDF analysis…")
-    vec = TfidfVectorizer(ngram_range=(1,3), stop_words="english", max_features=1000)
+    vec = TfidfVectorizer(ngram_range=(1,3), stop_words="english", max_features=1500)
     M   = vec.fit_transform(texts)
     feats   = vec.get_feature_names_out()
     avg_sc  = M.mean(axis=0).A1
@@ -719,8 +804,12 @@ def make_brief(pages, keyword, logf):
     terms = [
         {"term": feats[i], "score": round(float(avg_sc[i]),4), "pages": int(doc_fr[i])}
         for i in avg_sc.argsort()[::-1]
-        if doc_fr[i] >= thresh and avg_sc[i] > 0.004
+        if doc_fr[i] >= thresh
+        and avg_sc[i] > 0.004
+        and _is_quality_term(feats[i])          # ← smart filter
     ][:60]
+
+    logf(f"  ✅ {len(terms)} quality terms extracted")
 
     logf("📐 Analysing headings…")
     hdg_data = {}
