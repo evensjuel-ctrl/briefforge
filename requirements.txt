@@ -1,0 +1,11 @@
+flask>=3.0.0
+flask-cors>=4.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+openpyxl>=3.1.0
+cloudscraper>=1.2.71
+# Optional (entity extraction):
+# spacy>=3.7.0  →  then run: python -m spacy download en_core_web_sm
