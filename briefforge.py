@@ -574,7 +574,7 @@ function esc(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;'
 # ═══════════════════════════════════════════════════════════
 #  PYTHON BACKEND
 # ═══════════════════════════════════════════════════════════
-import re, sys, time, random, threading, json, io, traceback, uuid
+import re, sys, time, random, threading, json, io, traceback, uuid, os
 from collections import Counter
 
 import numpy as np
@@ -585,7 +585,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# ── Jobs store ─────────────────────────────────────────────
 jobs = {}
 
 # ── Anti-block UA pool ─────────────────────────────────────
@@ -594,48 +593,30 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
-]
-
-REFERERS = [
-    "https://www.google.com/",
-    "https://www.bing.com/",
-    "https://duckduckgo.com/",
-    "https://search.yahoo.com/",
 ]
 
 def rand_headers():
     return {
         "User-Agent": random.choice(UA_POOL),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,en-GB;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": random.choice(REFERERS),
-        "DNT": "1",
-        "Connection": "keep-alive",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": random.choice(["https://www.google.com/","https://www.bing.com/"]),
+        "DNT": "1", "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "cross-site",
-        "Sec-Fetch-User": "?1",
     }
 
-# ── Fetch with 3-layer anti-block chain ────────────────────
+
+# ── Fetch page with anti-block ────────────────────────────
 def fetch_page(url, logf):
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
     import requests
 
     html = None
 
-    # Layer 1: cloudscraper (Cloudflare bypass)
+    # Layer 1: cloudscraper
     try:
         import cloudscraper
-        sc = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            delay=3,
-        )
+        sc = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows","mobile":False})
         sc.headers.update(rand_headers())
         r = sc.get(url, timeout=22)
         if r.status_code == 200 and len(r.text) > 300:
@@ -644,7 +625,7 @@ def fetch_page(url, logf):
     except Exception as e:
         logf(f"  ⚠️  cloudscraper: {e}")
 
-    # Layer 2: requests + session + random UA
+    # Layer 2: requests
     if not html:
         try:
             sess = requests.Session()
@@ -653,137 +634,116 @@ def fetch_page(url, logf):
             if r.status_code == 200 and len(r.text) > 300:
                 html = r.text
                 logf(f"  ✅ Fetched (requests): {url[:70]}")
-            else:
-                logf(f"  ⚠️  HTTP {r.status_code}: {url[:70]}")
         except Exception as e:
             logf(f"  ⚠️  requests: {e}")
 
-    # Layer 3: Google cache fallback
+    # Layer 3: Google cache
     if not html:
         try:
-            gc_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
-            r = requests.get(gc_url, headers=rand_headers(), timeout=15)
+            gc = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
+            r = requests.get(gc, headers=rand_headers(), timeout=15)
             if r.status_code == 200 and len(r.text) > 300:
                 html = r.text
-                logf(f"  ✅ Fetched (Google cache): {url[:70]}")
-        except Exception:
-            pass
+                logf(f"  ✅ Fetched (cache): {url[:70]}")
+        except: pass
 
     if not html:
         logf(f"  ❌ Could not fetch: {url[:70]}")
         return None
 
-    # Parse HTML
+    # ── Smart HTML Parsing ─────────────────────────────────
     try:
         soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script","style","nav","footer","header","aside","noscript","iframe"]):
+
+        # Step 1: Remove all non-content tags
+        REMOVE_TAGS = [
+            "script","style","nav","footer","header","aside","noscript","iframe",
+            "svg","form","button","select","option","input","textarea","label",
+            "figure","figcaption","picture","video","audio","canvas","map",
+        ]
+        for tag in soup(REMOVE_TAGS):
             tag.decompose()
 
+        # Step 2: Remove by CSS selectors — menus, widgets, popups, ads
+        REMOVE_SELECTORS = [
+            "[class*='nav']","[class*='menu']","[class*='sidebar']",
+            "[class*='cookie']","[class*='popup']","[class*='modal']",
+            "[class*='banner']","[class*='breadcrumb']","[class*='pagination']",
+            "[class*='social']","[class*='share']","[class*='widget']",
+            "[class*='footer']","[class*='header']","[class*='toolbar']",
+            "[class*='cart']","[class*='checkout']","[class*='login']",
+            "[class*='signup']","[class*='subscribe']","[class*='newsletter']",
+            "[class*='advertisement']","[class*='sponsor']","[class*='promo']",
+            "[class*='related-']","[class*='recommended']",
+            "[id*='cookie']","[id*='popup']","[id*='modal']","[id*='banner']",
+            "[id*='sidebar']","[id*='nav']","[id*='menu']","[id*='footer']",
+            "[role='navigation']","[role='banner']","[role='contentinfo']",
+            "[role='complementary']","[role='search']","[role='form']",
+            "[aria-hidden='true']",
+        ]
+        for sel in REMOVE_SELECTORS:
+            try:
+                for el in soup.select(sel): el.decompose()
+            except: pass
+
+        # Step 3: Extract headings BEFORE content extraction
         headings = {}
         for lv in range(1, 7):
             tags = soup.find_all(f"h{lv}")
             if tags:
                 headings[f"h{lv}"] = [t.get_text(strip=True) for t in tags if t.get_text(strip=True)]
 
+        # Step 4: Try to find main content area
+        main_content = None
+        for selector in ["article", "main", "[role='main']",
+                         ".post-content", ".entry-content", ".article-content",
+                         ".blog-post", ".content-area", "#content", ".post-body"]:
+            found = soup.select_one(selector)
+            if found and len(found.get_text(strip=True)) > 200:
+                main_content = found
+                break
+
+        # Use main content if found, otherwise use body
+        source = main_content if main_content else soup.body or soup
+
+        # Step 5: Extract ONLY paragraph and heading text (skip random divs with garbage)
+        content_parts = []
+        CONTENT_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6",
+                        "li", "td", "th", "blockquote", "dd", "dt", "figcaption"}
+        for tag in source.find_all(CONTENT_TAGS):
+            txt = tag.get_text(" ", strip=True)
+            # Only keep if it has at least 3 real words (3+ letters each)
+            real_words = re.findall(r"\b[a-zA-Z]{3,}\b", txt)
+            if len(real_words) >= 3:
+                content_parts.append(txt)
+
+        text = " ".join(content_parts)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # Fallback: if content extraction found very little, use full body text
+        if len(text) < 200:
+            text = re.sub(r"\s+", " ", source.get_text(" ", strip=True)).strip()
+
+        # Step 6: Final cleanup — remove any remaining non-text artifacts
+        # Remove URLs
+        text = re.sub(r"https?://\S+", "", text)
+        # Remove email addresses
+        text = re.sub(r"\S+@\S+\.\S+", "", text)
+        # Remove isolated special chars and numbers
+        text = re.sub(r"\s+", " ", text).strip()
+
         meta = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
         meta_desc = meta.get("content", "") if meta else ""
         title_tag = soup.find("title")
         title = title_tag.get_text(strip=True) if title_tag else ""
 
-        # Remove extra noise: cookie banners, popups, nav widgets
-        for sel in ["[class*=\'cookie\']","[class*=\'popup\']","[class*=\'breadcrumb\']",
-                    "[class*=\'pagination\']","[class*=\'social\']","[id*=\'cookie\']",
-                    "[id*=\'popup\']","[role=\'navigation\']","[role=\'contentinfo\']"]:
-            try:
-                for el in soup.select(sel): el.decompose()
-            except Exception: pass
-
-        raw = soup.get_text(" ", strip=True)
-        # Keep sentence-like chunks only (strips menu/nav garbage)
-        lines = re.split(r'(?<=[.!?])\s+|\n', raw)
-        clean = [l.strip() for l in lines if len(re.findall(r"\b[a-zA-Z]{3,}\b", l)) >= 4]
-        text = re.sub(r"\s+", " ", " ".join(clean)).strip()
-        if len(text) < 300:  # fallback if too aggressive
-            text = re.sub(r"\s+", " ", raw).strip()
-        words = len(re.findall(r"\b\w+\b", text))
+        words = len(re.findall(r"\b[a-zA-Z]{3,}\b", text))
 
         return {"url": url, "text": text, "headings": headings,
                 "word_count": words, "title": title, "meta_desc": meta_desc}
     except Exception as e:
         logf(f"  ❌ Parse error: {e}")
         return None
-
-
-# ── Smart term quality filter ──────────────────────────────
-# Common UI/nav/garbage words that appear on every website but mean nothing for content
-_UI_GARBAGE = {
-    "cookie","cookies","privacy","policy","terms","copyright","rights reserved",
-    "all rights","subscribe","newsletter","sign up","log in","login","logout",
-    "sign in","register","account","cart","menu","search","home","back","next",
-    "previous","click","tap","swipe","scroll","share","follow","like","comment",
-    "reply","submit","cancel","close","open","read more","learn more","view",
-    "see more","show","hide","toggle","filter","sort","page","pages","load",
-    "loading","error","warning","alert","notice","message","notification",
-    "advertisement","sponsored","ad","ads","promo","sale","off","discount",
-    "free shipping","add to cart","buy now","shop now","contact us","about us",
-    "faq","help","support","feedback","review","reviews","rating","ratings",
-    "price","prices","cost","shipping","delivery","return","refund","checkout",
-    "payment","order","orders","track","tracking","wishlist","compare",
-    "related","recommended","popular","trending","new","featured","best seller",
-    "recently viewed","you may also","people also","customers also",
-    "js","css","html","php","url","http","https","www","com","org","net",
-    "nbsp","quot","amp","lt","gt","px","em","rem","rgb","rgba","hex",
-    "var","function","return","class","style","type","data","id","src",
-}
-
-def _is_quality_term(term: str) -> bool:
-    """Return True if the term is a real content term worth including in a brief."""
-    t = term.strip().lower()
-
-    # Too short (single chars or 2-char abbreviations like 'mp', 'ib', 'tb')
-    if len(t) <= 2:
-        return False
-
-    # All digits or mostly digits
-    if re.fullmatch(r"[\d\s\-\.]+", t):
-        return False
-
-    # Looks like an abbreviation: 2-4 uppercase letters only (e.g. RGB, CTA, SEO is OK but not random ones)
-    words_in_term = t.split()
-    if len(words_in_term) == 1 and len(t) <= 4 and t.isupper():
-        return False
-
-    # Contains special characters that indicate code/UI artifacts
-    if re.search(r"[{}<>\\|@#$%^*=+~`]", t):
-        return False
-
-    # Starts or ends with digits/punctuation
-    if re.match(r"^[\d\.\-_\/]", t) or re.search(r"[\d\.\-_\/]$", t):
-        return False
-
-    # Single repeated character
-    if len(set(t.replace(" ",""))) <= 2 and len(t) > 2:
-        return False
-
-    # Known UI garbage
-    if t in _UI_GARBAGE:
-        return False
-    for garbage in _UI_GARBAGE:
-        if t == garbage:
-            return False
-
-    # Must have at least one real alphabetic word of 3+ chars
-    real_words = [w for w in words_in_term if re.fullmatch(r"[a-z]{3,}", w)]
-    if not real_words:
-        return False
-
-    # For multi-word phrases: each word should be a real word (no random abbreviations)
-    if len(words_in_term) > 1:
-        for w in words_in_term:
-            if len(w) <= 2 and not re.fullmatch(r"[a-z]{2}", w):
-                return False
-
-    return True
 
 
 # ── Brief generation ───────────────────────────────────────
@@ -794,20 +754,36 @@ def make_brief(pages, keyword, logf):
     wcs   = [p["word_count"] for p in pages]
 
     logf("🔬 Running TF-IDF analysis…")
-    vec = TfidfVectorizer(ngram_range=(1,3), stop_words="english", max_features=1500)
-    M   = vec.fit_transform(texts)
-    feats   = vec.get_feature_names_out()
-    avg_sc  = M.mean(axis=0).A1
-    doc_fr  = (M > 0).sum(axis=0).A1
-    thresh  = max(1, len(texts) * 0.35)
 
-    terms = [
-        {"term": feats[i], "score": round(float(avg_sc[i]),4), "pages": int(doc_fr[i])}
-        for i in avg_sc.argsort()[::-1]
-        if doc_fr[i] >= thresh
-        and avg_sc[i] > 0.004
-        and _is_quality_term(feats[i])          # ← smart filter
-    ][:60]
+    # KEY FIX: token_pattern only accepts words with 3+ letters, pure alphabetic
+    # This is the #1 defense against garbage like 'mp', 'ib', 'xq', 'b8u'
+    vec = TfidfVectorizer(
+        ngram_range=(1, 3),
+        stop_words="english",
+        max_features=2000,
+        token_pattern=r"\b[a-zA-Z]{3,}\b",   # ← ONLY real 3+ letter words
+        min_df=2 if len(texts) >= 3 else 1,   # must appear in 2+ docs
+    )
+    M = vec.fit_transform(texts)
+    feats  = vec.get_feature_names_out()
+    avg_sc = M.mean(axis=0).A1
+    doc_fr = (M > 0).sum(axis=0).A1
+    thresh = max(1, len(texts) * 0.35)
+
+    # Collect raw terms sorted by score
+    raw_terms = []
+    for i in avg_sc.argsort()[::-1]:
+        if doc_fr[i] >= thresh and avg_sc[i] > 0.005:
+            raw_terms.append({
+                "term": feats[i],
+                "score": round(float(avg_sc[i]), 4),
+                "pages": int(doc_fr[i])
+            })
+        if len(raw_terms) >= 100:
+            break
+
+    # Final quality gate: filter out remaining nonsense
+    terms = [t for t in raw_terms if _is_quality_term(t["term"])][:60]
 
     logf(f"  ✅ {len(terms)} quality terms extracted")
 
@@ -829,7 +805,8 @@ def make_brief(pages, keyword, logf):
             doc = nlp(p["text"][:60000])
             raw_ents.extend(
                 (e.text.strip(), e.label_) for e in doc.ents
-                if len(e.text.strip()) > 1 and e.label_ not in SKIP
+                if len(e.text.strip()) > 2 and e.label_ not in SKIP
+                and re.fullmatch(r"[A-Za-z\s\-']+", e.text.strip())
             )
         labels = dict(raw_ents)
         ents = [{"entity":e,"count":c,"type":labels.get(e,"")}
@@ -858,6 +835,104 @@ def make_brief(pages, keyword, logf):
     }
 
 
+# ── Quality filter (final gate) ────────────────────────────
+# Common English bigrams for word validation
+_BIGRAMS = frozenset([
+    'th','he','in','er','an','re','on','at','en','nd','ti','es','or','te','of',
+    'ed','is','it','al','ar','st','to','nt','ng','se','ha','as','ou','io','le',
+    've','co','me','de','hi','ri','ro','ic','ne','ea','ra','ce','li','ch','ll',
+    'be','ma','si','om','ur','ca','el','ta','la','ns','ge','ly','ei','no','pe',
+    'ni','wa','po','tr','sh','di','un','ho','pr','pl','so','su','ot','pa','lo',
+    'ow','ag','mo','bl','wi','us','do','ck','ke','ay','ss','ad','ct','ac','il',
+    'ap','ab','oo','ul','cl','fi','am','ie','id','ig','ut','up','cr','ph','ol',
+    'em','gr','tu','ry','fl','ee','wo','ld','ba','ru','dr','sp','pu','br','fr',
+    'wh','ai','oi','sc','im','mi','fe','gu','ex','fo','av','fu','ew','sw','sk',
+    'aw','sn','sl','sm','sq','tw','wr','kn','gl','mu','nu','bu','cu','du',
+    'pi','bi','ty','qu','op','pt','nk','ft','mp','lm','rm','rn','rk','lt',
+    'rt','rd','ds','ts','ks','ps','ms','ns','rs','ls','ws','gs','bs',
+    'oy','ey','ny','dy','my','gy','hy','by','py','sy','ky',
+    'lu','xu','ux','xy','ox','ax','iz','zi','za','zo','zu',
+    'oa','ue','ui','ia','ua','eo','ae','oe','pp','ip','pe','yn','et',
+    'da','fa','ga','ja','ka','na','va','ya','bo','go','jo','vo','yo',
+    'ob','od','og','ok','os','ov','oz','ub','ye','rb',
+    'bb','dd','ff','gg','mm','nn','rr','tt','zz','wn',
+])
+
+_NOISE = frozenset([
+    "cookie","cookies","privacy","policy","terms","copyright","subscribe",
+    "newsletter","login","logout","signup","register","account","cart","menu",
+    "search","click","share","follow","submit","cancel","close","loading",
+    "advertisement","sponsored","promo","discount","checkout","shipping",
+    "related","recommended","popular","trending","featured","wishlist",
+])
+
+# Known 3-letter English words (comprehensive)
+_SHORT_OK = frozenset(
+    "the and for are but not you all any can had her was one our out day get has him his how "
+    "its let may new now old see way who boy did few got run say she too use dad mom ago bad "
+    "bed big box bus car cut dog ear eat end far fly fun gas hat hot ice job key kid law lay "
+    "led lot low map mix nor odd oil own pay per pet put ran red sat set sir six sky sum sun "
+    "ten tip top try two van war wet win won yes yet add age aid aim air art ask ate bag "
+    "ban bar bat bay bee bet bit bow bud bug buy cab cap cat cup dam den dew dig dim dip dot "
+    "dry dub due dug dye fan fat fed fig fit fix fog fox fur gap gem gin god gum gun gut guy "
+    "gym ham hen hid hip hit hog hop hug hut inn jam jar jaw jet joy jug kit lab lad lag lap "
+    "lid lip log mad mat men met mob mop mud mug nap net nil nod nut oak oar oat opt ore owe "
+    "owl pad pan pat paw pea peg pen pie pig pin pit pod pop pot pro pub pun pup raw ray rib "
+    "rid rig rim rip rod rot row rub rug sad sap saw sea sit ski sob sod sow spy sty sub sue "
+    "tab tag tan tap tar tax tea tie tin toe ton toy tub tug vet vow wag web wed wig wit woe "
+    "wok wow yam yap yew zoo wax rap nap cub dip sew hem zip cot jot pry vie vie wry irk "
+    "rev wad ebb flu kin pew sly ilk apt ivy awe bog cue era eve hue ire ore rue urn pus roe "
+    "spa sac ale yak elk emu ape "
+    "abs act ads arm ash axe ban bio bib bot con cop cow coy cry cue dim din dip doc don dow "
+    "duo dug ego elm elf emu err eve ewe fab fad fax fee few fib fin fir flu foe fop fry gag "
+    "gal gap gel gig gin gnu gob goo gum gym hag hap hay hem hew hex hob hog hon hop hub hue "
+    "hum icy ilk imp ink inn ion ire irk jab jag jam jig jog jot jug jut keg ken kin kit lab "
+    "lag lam lap lax lea leg lei lib lid lob lop lug lye mac mar maw meg mob mod mow nab nag "
+    "nap nib nil nip nob nor nub oaf oak oar oat ode opt orb ore our ova owe pact pal pam pan "
+    "pap par pat paw pay pea peg pen pep per pew pie pig pin pip pit ply ply pod pom pop pow "
+    "pox pry pug pun pup pus put rub rue rug rum rut rye "
+    "sac sad sag sal sap sat sax say sea set sew shy sin sip sir sit six ski sly sob sod son "
+    "sop sot sow soy spa spy sty sub sue sum sun sup tab tad tag tan tap tar tat tax tea ted "
+    "ten the tic tie tin tip tit tod toe tog ton too top tot tow toy tub tug tun two urn "
+    "van vat vet vex via vie vim vow wad wag wan war wax way web wed wet who wig win wit woe "
+    "wok won woo wop wow yak yam yap yaw yea yew yin you yow zag zap zed zen zig zip zoo".split()
+)
+
+def _is_quality_term(term):
+    """Final gate: is this a real English content term?"""
+    words = term.lower().strip().split()
+
+    for w in words:
+        if len(w) < 3:
+            return False
+        if not re.fullmatch(r"[a-z]+", w):
+            return False
+        if w in _NOISE:
+            return False
+        if not re.search(r"[aeiouy]", w):
+            return False
+        if re.search(r"[bcdfghjklmnpqrstvwxz]{4,}", w):
+            return False
+
+        # 3-letter words: must be in known word list
+        if len(w) == 3:
+            if w not in _SHORT_OK:
+                return False
+            continue
+
+        # 4+ letter words: bigram check
+        bgs = [w[i:i+2] for i in range(len(w)-1)]
+        hits = sum(1 for b in bgs if b in _BIGRAMS)
+        ratio = hits / len(bgs) if bgs else 0
+
+        if len(w) == 4 and ratio < 0.67:
+            return False
+        elif len(w) > 4 and ratio < 0.4:
+            return False
+
+    return True
+
+
 # ── Background worker ──────────────────────────────────────
 def worker(job_id, urls, keyword):
     def logf(m): jobs[job_id]["log"].append(m)
@@ -874,7 +949,7 @@ def worker(job_id, urls, keyword):
             time.sleep(random.uniform(1.2, 2.8))
 
         if len(pages) < 2:
-            raise ValueError(f"Only {len(pages)} page(s) fetched successfully — need at least 2.")
+            raise ValueError(f"Only {len(pages)} page(s) fetched — need at least 2.")
 
         jobs[job_id]["progress"] = 66
         brief = make_brief(pages, keyword, logf)
@@ -939,29 +1014,21 @@ def api_export(jid):
     b   = job["brief"]
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        # Summary
         pd.DataFrame({
             "Field": ["Keyword","Recommended Word Count","Avg Words","Median Words","Min","Max","Competitors"],
             "Value": [b["keyword"],b["recommended_word_count"],b["avg_competitor_words"],
                       b["median_competitor_words"],b["min_competitor_words"],b["max_competitor_words"],b["competitor_count"]]
         }).to_excel(w, sheet_name="Summary", index=False)
 
-        # Competitors
         if b.get("competitors"):
             pd.DataFrame(b["competitors"]).to_excel(w, sheet_name="Competitors", index=False)
-
-        # Terms
         if b.get("must_include_terms"):
             pd.DataFrame(b["must_include_terms"]).to_excel(w, sheet_name="Must-Include Terms", index=False)
-
-        # Headings
         for lv in ["h1","h2","h3"]:
             rows = b.get("headings",{}).get(lv,[])
             if rows:
                 pd.DataFrame(rows, columns=["heading","count"]).to_excel(
                     w, sheet_name=f"{lv.upper()} Suggestions", index=False)
-
-        # Entities
         if b.get("key_entities"):
             pd.DataFrame(b["key_entities"]).to_excel(w, sheet_name="Key Entities", index=False)
 
@@ -983,6 +1050,8 @@ if __name__ == "__main__":
     print("  BriefForge is running!")
     print("  Open your browser: http://localhost:5000")
     print("═"*56 + "\n")
+    import os
+    port = int(os.environ.get("PORT", 5000))
     import os
 port = int(os.environ.get("PORT", 5000))
 app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
